@@ -4,10 +4,16 @@
 #   Plot 1 — Mean entropy per layer across all three conditions
 #   Plot 2 — Entropy difference (delta) vs original per layer
 #   Plot 3 — Per-layer box plots showing variance across sentences
-#   significance_tests.txt — paired t-tests per layer
+#   Plot 4 — Heatmap of delta vs original
+#   significance_tests_vs_original.txt — paired t-tests per layer vs original
+#   direct_comparison_tests.txt       — paired t-tests NP-shuffled vs full-shuffle
+#   effect_sizes.csv                  — per-layer mean deltas + paired Cohen's d
+#   layer_group_summary.csv           — early/middle/late summary table
 #
-# Run from the project root, for example:
-#   python analysis/plot_entropy.py --results_path results/entropy_results_1000.json --output_dir results/plots_1000
+# Example:
+#   python analysis/plot_entropy.py \
+#       --results_path results/entropy_results_sst2_2000.json \
+#       --output_dir results/plots_sst2_2000
 
 import argparse
 import json
@@ -16,6 +22,7 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
+import pandas as pd
 from scipy import stats
 
 
@@ -26,9 +33,7 @@ from scipy import stats
 DEFAULT_RESULTS_PATH = "results/entropy_results.json"
 DEFAULT_OUTPUT_DIR = "results/plots"
 N_LAYERS = 12
-LAYER_LABELS = [str(i + 1) for i in range(N_LAYERS)]
 
-# Condition display names and colours
 CONDITIONS = {
     "original": {
         "label": "Original",
@@ -47,7 +52,6 @@ CONDITIONS = {
     },
 }
 
-# Shared plot styling
 STYLE = {
     "figure.dpi": 150,
     "axes.spines.top": False,
@@ -65,17 +69,40 @@ STYLE = {
 
 
 # ---------------------------------------------------------------------------
-# Data loading & cleaning
+# Helpers
+# ---------------------------------------------------------------------------
+
+def layer_group(layer_idx_1based: int) -> str:
+    if 1 <= layer_idx_1based <= 4:
+        return "early"
+    if 5 <= layer_idx_1based <= 8:
+        return "middle"
+    return "late"
+
+
+def paired_cohens_d(x, y):
+    """
+    Cohen's d for paired samples:
+        mean(diff) / std(diff)
+    """
+    diff = np.array(x) - np.array(y)
+    sd = diff.std(ddof=1)
+    if sd == 0:
+        return 0.0
+    return diff.mean() / sd
+
+
+# ---------------------------------------------------------------------------
+# Data loading
 # ---------------------------------------------------------------------------
 
 def load_results(path):
     """
-    Loads entropy results JSON and returns a dict:
+    Loads entropy results JSON and returns:
     {
       condition_name: np.ndarray of shape (n_sentences, 12)
     }
-
-    Rows with any None values (failed sentences) are dropped.
+    Rows with any None values are dropped.
     """
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
@@ -84,10 +111,7 @@ def load_results(path):
     for condition, entropies in raw.items():
         arr = np.array(entropies, dtype=object)
 
-        # Drop rows that contain None (failed sentences)
-        mask = np.array([
-            all(v is not None for v in row) for row in arr
-        ])
+        mask = np.array([all(v is not None for v in row) for row in arr])
         clean = arr[mask].astype(float)
 
         dropped = (~mask).sum()
@@ -98,6 +122,21 @@ def load_results(path):
         print(f"  [{condition}] {clean.shape[0]} sentences x {clean.shape[1]} layers loaded.")
 
     return data
+
+
+def to_long_dataframe(data):
+    rows = []
+    for condition, arr in data.items():
+        for sentence_id in range(arr.shape[0]):
+            for layer_idx in range(arr.shape[1]):
+                rows.append({
+                    "sentence_id": sentence_id,
+                    "condition": condition,
+                    "layer": layer_idx + 1,
+                    "layer_group": layer_group(layer_idx + 1),
+                    "entropy": arr[sentence_id, layer_idx],
+                })
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -112,15 +151,14 @@ def plot_mean_entropy(data, output_dir):
             if cond_key not in data:
                 continue
 
-            arr = data[cond_key]           # (n_sentences, 12)
-            means = arr.mean(axis=0)       # (12,)
-            sems = stats.sem(arr, axis=0)  # (12,)
+            arr = data[cond_key]
+            means = arr.mean(axis=0)
+            sems = stats.sem(arr, axis=0)
 
             x = np.arange(1, N_LAYERS + 1)
 
             ax.plot(
-                x,
-                means,
+                x, means,
                 label=meta["label"],
                 color=meta["color"],
                 linestyle=meta["ls"],
@@ -152,7 +190,7 @@ def plot_mean_entropy(data, output_dir):
 
 
 # ---------------------------------------------------------------------------
-# Plot 2 — Entropy delta vs original
+# Plot 2 — Delta vs original
 # ---------------------------------------------------------------------------
 
 def plot_entropy_delta(data, output_dir):
@@ -184,8 +222,7 @@ def plot_entropy_delta(data, output_dir):
             delta = means - original_means
 
             ax.plot(
-                x,
-                delta,
+                x, delta,
                 label=meta["label"],
                 color=meta["color"],
                 linestyle=meta["ls"],
@@ -195,9 +232,7 @@ def plot_entropy_delta(data, output_dir):
             )
 
             ax.fill_between(
-                x,
-                0,
-                delta,
+                x, 0, delta,
                 color=meta["color"],
                 alpha=0.08,
             )
@@ -216,7 +251,7 @@ def plot_entropy_delta(data, output_dir):
 
 
 # ---------------------------------------------------------------------------
-# Plot 3 — Box plots per layer
+# Plot 3 — Boxplots
 # ---------------------------------------------------------------------------
 
 def plot_boxplots(data, output_dir):
@@ -233,7 +268,6 @@ def plot_boxplots(data, output_dir):
         for ax, cond_key in zip(axes, conditions_present):
             meta = CONDITIONS[cond_key]
             arr = data[cond_key]
-
             layer_data = [arr[:, i] for i in range(N_LAYERS)]
 
             bp = ax.boxplot(
@@ -269,14 +303,58 @@ def plot_boxplots(data, output_dir):
 
 
 # ---------------------------------------------------------------------------
-# Statistical tests
+# Plot 4 — Heatmap of delta vs original
 # ---------------------------------------------------------------------------
 
-def run_significance_tests(data, output_dir):
-    """
-    Paired t-test at each layer comparing each corruption condition
-    to the original.
-    """
+def plot_delta_heatmap(data, output_dir):
+    if "original" not in data:
+        print("  [SKIP] plot_delta_heatmap requires 'original' condition.")
+        return
+
+    original_means = data["original"].mean(axis=0)
+
+    rows = []
+    labels = []
+
+    for cond_key in ["np_shuffled", "full_shuffled"]:
+        if cond_key not in data:
+            continue
+        delta = data[cond_key].mean(axis=0) - original_means
+        rows.append(delta)
+        labels.append(CONDITIONS[cond_key]["label"])
+
+    if not rows:
+        print("  [SKIP] No corruption conditions present for heatmap.")
+        return
+
+    heatmap = np.vstack(rows)
+
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(9, 2.8))
+        im = ax.imshow(heatmap, aspect="auto", cmap="coolwarm", interpolation="nearest")
+
+        ax.set_xticks(np.arange(N_LAYERS))
+        ax.set_xticklabels(np.arange(1, N_LAYERS + 1))
+        ax.set_yticks(np.arange(len(labels)))
+        ax.set_yticklabels(labels)
+        ax.set_xlabel("BERT layer")
+        ax.set_title("Entropy increase relative to original — heatmap")
+
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("Δ entropy vs original")
+
+        fig.tight_layout()
+        path = os.path.join(output_dir, "plot4_delta_heatmap.png")
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Statistical tests and effect sizes
+# ---------------------------------------------------------------------------
+
+def run_significance_tests_vs_original(data, output_dir):
     if "original" not in data:
         print("  [SKIP] significance tests require 'original' condition.")
         return
@@ -299,11 +377,7 @@ def run_significance_tests(data, output_dir):
                 continue
 
             corrupted = data[cond_key]
-            t_stat, p_val = stats.ttest_rel(
-                corrupted[:, layer_idx],
-                original[:, layer_idx]
-            )
-
+            _, p_val = stats.ttest_rel(corrupted[:, layer_idx], original[:, layer_idx])
             sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else ""
             row += f"p={p_val:.4f} {sig:<4}          "
 
@@ -313,13 +387,100 @@ def run_significance_tests(data, output_dir):
     print("\n--- Paired t-test results (corruption vs original) ---")
     print(output)
 
-    path = os.path.join(output_dir, "significance_tests.txt")
+    path = os.path.join(output_dir, "significance_tests_vs_original.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write("Paired t-test: corruption condition vs original\n")
         f.write("* p<0.05  ** p<0.01  *** p<0.001\n\n")
         f.write(output)
 
     print(f"\nSaved: {path}")
+
+
+def run_direct_comparison_tests(data, output_dir):
+    if "np_shuffled" not in data or "full_shuffled" not in data:
+        print("  [SKIP] direct comparison requires both np_shuffled and full_shuffled.")
+        return
+
+    np_arr = data["np_shuffled"]
+    full_arr = data["full_shuffled"]
+
+    lines = []
+    lines.append(f"{'Layer':<8}{'NP vs Full-shuffle':<24}")
+    lines.append("-" * 32)
+
+    for layer_idx in range(N_LAYERS):
+        _, p_val = stats.ttest_rel(np_arr[:, layer_idx], full_arr[:, layer_idx])
+        sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else ""
+        lines.append(f"{layer_idx + 1:<8}p={p_val:.4f} {sig:<4}")
+
+    output = "\n".join(lines)
+    print("\n--- Direct paired t-test results (NP-shuffled vs full-shuffle) ---")
+    print(output)
+
+    path = os.path.join(output_dir, "direct_comparison_tests.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("Paired t-test: NP-shuffled vs full-shuffle\n")
+        f.write("* p<0.05  ** p<0.01  *** p<0.001\n\n")
+        f.write(output)
+
+    print(f"\nSaved: {path}")
+
+
+def save_effect_sizes(data, output_dir):
+    if "original" not in data:
+        print("  [SKIP] effect size table requires 'original'.")
+        return
+
+    rows = []
+    original = data["original"]
+
+    for layer_idx in range(N_LAYERS):
+        base = original[:, layer_idx]
+
+        row = {
+            "layer": layer_idx + 1,
+            "original_mean": base.mean(),
+        }
+
+        for cond_key in ["np_shuffled", "full_shuffled"]:
+            if cond_key not in data:
+                continue
+
+            arr = data[cond_key][:, layer_idx]
+            diff = arr - base
+
+            row[f"{cond_key}_mean"] = arr.mean()
+            row[f"{cond_key}_delta_mean"] = diff.mean()
+            row[f"{cond_key}_cohens_d_paired"] = paired_cohens_d(arr, base)
+
+        if "np_shuffled" in data and "full_shuffled" in data:
+            np_arr = data["np_shuffled"][:, layer_idx]
+            full_arr = data["full_shuffled"][:, layer_idx]
+            row["np_vs_full_delta_mean"] = (full_arr - np_arr).mean()
+            row["np_vs_full_cohens_d_paired"] = paired_cohens_d(full_arr, np_arr)
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    path = os.path.join(output_dir, "effect_sizes.csv")
+    df.to_csv(path, index=False)
+    print(f"Saved: {path}")
+
+
+def save_layer_group_summary(results_df, output_dir):
+    summary = (
+        results_df
+        .groupby(["condition", "layer_group"], as_index=False)["entropy"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+
+    # flatten multi-index columns if needed
+    summary.columns = [c if isinstance(c, str) else "_".join([x for x in c if x]) for c in summary.columns]
+
+    path = os.path.join(output_dir, "layer_group_summary.csv")
+    summary.to_csv(path, index=False)
+    print(f"Saved: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +499,7 @@ if __name__ == "__main__":
         "--output_dir",
         type=str,
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory to save plots and significance table."
+        help="Directory to save plots and tables."
     )
     args = parser.parse_args()
 
@@ -346,13 +507,20 @@ if __name__ == "__main__":
 
     print(f"Loading results from: {args.results_path}")
     data = load_results(args.results_path)
+    results_df = to_long_dataframe(data)
 
     print("\nGenerating plots...")
     plot_mean_entropy(data, args.output_dir)
     plot_entropy_delta(data, args.output_dir)
     plot_boxplots(data, args.output_dir)
+    plot_delta_heatmap(data, args.output_dir)
 
     print("\nRunning significance tests...")
-    run_significance_tests(data, args.output_dir)
+    run_significance_tests_vs_original(data, args.output_dir)
+    run_direct_comparison_tests(data, args.output_dir)
+
+    print("\nSaving summary tables...")
+    save_effect_sizes(data, args.output_dir)
+    save_layer_group_summary(results_df, args.output_dir)
 
     print(f"\nAll outputs saved to {args.output_dir}/")
